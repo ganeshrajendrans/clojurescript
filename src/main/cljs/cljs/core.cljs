@@ -882,6 +882,17 @@
   (-iterator [coll]
     "Returns an iterator for coll."))
 
+(defprotocol IDrop
+  "Protocol for persistent or algorithmically defined collections to provide a
+  means of dropping N items that is more efficient than sequential walking."
+  (^clj-or-nil -drop [coll n]
+    "Returns a collection that is ISequential, ISeq, and IReduce. It is also
+     useful if the returned coll implements IDrop for subsequent use in a
+     partition-like scenario.
+
+     If n is <= 0, return coll.
+     If n drops to or past the end of the collection, return nil."))
+
 ;; Printing support
 
 (deftype StringBufferWriter [sb]
@@ -1627,6 +1638,14 @@ reduces them without incurring seq initialization"
                (IndexedSeq. arr (inc i) nil)
                nil))
 
+  IDrop
+  (-drop [coll n]
+    (if (pos? n)
+      (if (< (+ i n) (alength arr))
+        (IndexedSeq. arr (+ i n) nil)
+        nil)
+      coll))
+
   ICounted
   (-count [_]
     (max 0 (- (alength arr) i)))
@@ -1945,10 +1964,12 @@ reduces them without incurring seq initialization"
 (defn nthrest
   "Returns the nth rest of coll, coll when n is 0."
   [coll n]
-    (loop [n n xs coll]
-      (if-let [xs (and (pos? n) (seq xs))]
-        (recur (dec n) (rest xs))
-        xs)))
+    (if (implements? IDrop coll)
+      (or (-drop coll n) ())
+      (loop [n n xs coll]
+        (if-let [xs (and (pos? n) (seq xs))]
+          (recur (dec n) (rest xs))
+          xs))))
 
 (defn get
   "Returns the value mapped to key, not-found or nil if key not present
@@ -2993,10 +3014,12 @@ reduces them without incurring seq initialization"
 (defn nthnext
   "Returns the nth next of coll, (seq coll) when n is 0."
   [coll n]
-  (loop [n n xs (seq coll)]
-    (if (and xs (pos? n))
-      (recur (dec n) (next xs))
-      xs)))
+  (if (implements? IDrop coll)
+    (-drop coll n)
+    (loop [n n xs (seq coll)]
+      (if (and xs (pos? n))
+        (recur (dec n) (next xs))
+        xs))))
 
 ;;;;;;;;;;;;;;;;;;;;;;;;;; basics ;;;;;;;;;;;;;;;;;;
 
@@ -4824,7 +4847,7 @@ reduces them without incurring seq initialization"
            (cons (first s) (take (dec n) (rest s))))))))
 
 (defn drop
-  "Returns a lazy sequence of all but the first n items in coll.
+  "Returns a laziness-preserving sequence of all but the first n items in coll.
   Returns a stateful transducer when no collection is provided."
   ([n]
    {:pre [(number? n)]}
@@ -4841,12 +4864,14 @@ reduces them without incurring seq initialization"
                   (rf result input))))))))
   ([n coll]
    {:pre [(number? n)]}
-     (let [step (fn [n coll]
-                  (let [s (seq coll)]
-                    (if (and (pos? n) s)
-                      (recur (dec n) (rest s))
-                      s)))]
-       (lazy-seq (step n coll)))))
+     (if (implements? IDrop coll)
+       (or (-drop coll n) ())
+       (let [step (fn [n coll]
+                    (let [s (seq coll)]
+                      (if (and (pos? n) s)
+                        (recur (dec n) (rest s))
+                        s)))]
+         (lazy-seq (step n coll))))))
 
 (defn drop-last
   "Return a lazy sequence of all but the last n (default 1) items in coll"
@@ -5014,6 +5039,14 @@ reduces them without incurring seq initialization"
 
   ICollection
   (-conj [coll o] (cons o coll))
+
+  IDrop
+  (-drop [coll n]
+    (if (== count -1)
+      coll
+      (let [dropped-count (- count n)]
+        (when (pos? dropped-count)
+          (Repeat. nil dropped-count val nil nil)))))
 
   IEmptyableCollection
   (-empty [coll] (.-EMPTY List))
@@ -5641,6 +5674,15 @@ reduces them without incurring seq initialization"
       (<= cnt 32) (IndexedSeq. tail 0 nil)
       :else (chunked-seq coll (first-array-for-longvec coll) 0 0)))
 
+  IDrop
+  (-drop [coll n]
+    (if (neg? n)
+      coll
+      (if (< n cnt)
+        (let [offset (js-mod n 32)]
+          (chunked-seq coll (unchecked-array-for coll n) (- n offset) offset))
+        nil)))
+
   ICounted
   (-count [coll] cnt)
 
@@ -5844,6 +5886,17 @@ reduces them without incurring seq initialization"
           nil
           s))
       (-chunked-next coll)))
+
+  IDrop
+  (-drop [coll n]
+    (let [o (+ off n)]
+      (if (< o (alength node))
+        (chunked-seq vec node i o)
+        (let [i (+ i o)]
+          (if (< i (-count vec))
+            (let [new-offset (js-mod i 32)]
+              (chunked-seq vec (unchecked-array-for vec i) (- i new-offset) new-offset))
+            nil)))))
 
   ICollection
   (-conj [coll o]
@@ -6860,6 +6913,11 @@ reduces them without incurring seq initialization"
     (when (< i (- (alength arr) 2))
       (PersistentArrayMapSeq. arr (+ i 2) nil)))
 
+  IDrop
+  (-drop [coll n]
+    (when (< n (-count coll))
+      (PersistentArrayMapSeq. arr (+ i (* 2 n)) nil)))
+
   IReduce
   (-reduce [coll f] (seq-reduce f coll))
   (-reduce [coll f start] (seq-reduce f start coll)))
@@ -6959,6 +7017,11 @@ reduces them without incurring seq initialization"
   ISeqable
   (-seq [coll]
     (persistent-array-map-seq arr 0 nil))
+
+  IDrop
+  (-drop [coll n]
+    (when-some [s (-seq coll)]
+      (-drop s n)))
 
   ICounted
   (-count [coll] cnt)
@@ -9733,6 +9796,47 @@ reduces them without incurring seq initialization"
       (when-let [s (seq coll)]
         (cons (take n s) (partition-all n step (drop step s)))))))
 
+(defn splitv-at
+  "Returns a vector of [(into [] (take n) coll) (drop n coll)]"
+  [n coll]
+  [(into [] (take n) coll) (drop n coll)])
+
+(defn partitionv
+  "Returns a lazy sequence of vectors of n items each, at offsets step
+  apart. If step is not supplied, defaults to n, i.e. the partitions
+  do not overlap. If a pad collection is supplied, use its elements as
+  necessary to complete last partition upto n items. In case there are
+  not enough padding elements, return a partition with less than n items."
+  ([n coll]
+   (partitionv n n coll))
+  ([n step coll]
+   (lazy-seq
+     (when-let [s (seq coll)]
+       (let [p (into [] (take n) s)]
+         (when (= n (count p))
+           (cons p (partitionv n step (nthrest s step))))))))
+  ([n step pad coll]
+   (lazy-seq
+     (when-let [s (seq coll)]
+       (let [p (into [] (take n) s)]
+         (if (= n (count p))
+           (cons p (partitionv n step pad (nthrest s step)))
+           (list (into [] (take n) (concat p pad)))))))))
+
+(defn partitionv-all
+  "Returns a lazy sequence of vector partitions, but may include
+  partitions with fewer than n items at the end.
+  Returns a stateful transducer when no collection is provided."
+  ([n]
+   (partition-all n))
+  ([n coll]
+   (partitionv-all n n coll))
+  ([n step coll]
+   (lazy-seq
+     (when-let [s (seq coll)]
+       (let [seg (into [] (take n) coll)]
+         (cons seg (partitionv-all n step (drop step s))))))))
+
 (defn take-while
   "Returns a lazy sequence of successive items from coll while
   (pred item) returns logical true. pred must be free of side-effects.
@@ -9820,7 +9924,12 @@ reduces them without incurring seq initialization"
       (set! i (+ i step))
       ret)))
 
-(deftype IntegerRange [meta start end step ^:mutable chunk ^:mutable chunk-next ^:mutable __hash]
+(defn- range-count
+  "Returns exact size of remaining items in an IntegerRange."
+  [start end step]
+  (Math/ceil (/ (- end start) step)))
+
+(deftype IntegerRange [meta start end step cnt ^:mutable __hash]
   Object
   (toString [coll]
     (pr-str* coll))
@@ -9834,23 +9943,15 @@ reduces them without incurring seq initialization"
     (-lastIndexOf coll x (count coll)))
   (lastIndexOf [coll x start]
     (-lastIndexOf coll x start))
-  (forceChunk [coll]
-    (when (nil? chunk)
-      (let [count (-count coll)]
-        (if (> count 32)
-          (do
-            (set! chunk-next (IntegerRange. nil (+ start (* step 32)) end step nil nil nil))
-            (set! chunk (IntegerRangeChunk. start step 32)))
-          (set! chunk (IntegerRangeChunk. start step count))))))
 
   ICloneable
-  (-clone [_] (IntegerRange. meta start end step chunk chunk-next __hash))
+  (-clone [_] (IntegerRange. meta start end step cnt __hash))
 
   IWithMeta
   (-with-meta [rng new-meta]
     (if (identical? new-meta meta)
       rng
-      (IntegerRange. new-meta start end step chunk chunk-next __hash)))
+      (IntegerRange. new-meta start end step cnt __hash)))
 
   IMeta
   (-meta [rng] meta)
@@ -9874,23 +9975,27 @@ reduces them without incurring seq initialization"
   (-next [rng]
     (if (pos? step)
       (when (< (+ start step) end)
-        (IntegerRange. nil (+ start step) end step nil nil nil))
+        (IntegerRange. nil (+ start step) end step (range-count (+ start step) end step) nil))
       (when (> (+ start step) end)
-        (IntegerRange. nil (+ start step) end step nil nil nil))))
+        (IntegerRange. nil (+ start step) end step (range-count (+ start step) end step) nil))))
+
+  IDrop
+  (-drop [rng n]
+    (if (pos? n)
+      (if (< n cnt)
+        (IntegerRange. nil (+ start (* step n)) end step (- cnt n) nil)
+        nil)
+      rng))
 
   IChunkedSeq
   (-chunked-first [rng]
-    (.forceChunk rng)
-    chunk)
+    (IntegerRangeChunk. start step cnt))
   (-chunked-rest [rng]
-    (.forceChunk rng)
-    (if (nil? chunk-next)
-      ()
-      chunk-next))
+    ())
 
   IChunkedNext
   (-chunked-next [rng]
-    (seq (-chunked-rest rng)))
+    nil)
 
   ICollection
   (-conj [rng o] (cons o rng))
@@ -9907,7 +10012,7 @@ reduces them without incurring seq initialization"
 
   ICounted
   (-count [rng]
-    (Math/ceil (/ (- end start) step)))
+    cnt)
 
   IIndexed
   (-nth [rng n]
@@ -10056,14 +10161,14 @@ reduces them without incurring seq initialization"
      (if (<= end start)
        ()
        (if (and (integer? start) (integer? end) (integer? step))
-         (IntegerRange. nil start end step nil nil nil)
+         (IntegerRange. nil start end step (range-count start end step) nil)
          (Range. nil start end step nil nil nil)))
 
      (neg? step)
      (if (>= end start)
        ()
        (if (and (integer? start) (integer? end) (integer? step))
-         (IntegerRange. nil start end step nil nil nil)
+         (IntegerRange. nil start end step (range-count start end step) nil)
          (Range. nil start end step nil nil nil)))
 
      :else
